@@ -5,7 +5,7 @@
 
 import {
   ObjectStore, PKT_DELIM, PKT_FLUSH, ZERO_OID, decodePktLines, encodePktLine, parseTag,
-  readPackInto, writePack, type GitObject,
+  readPackInto, sha1Hex, writePack, type GitObject,
 } from './gitcore.ts';
 import { Forge, Repo, VIEWER } from './store.ts';
 
@@ -20,6 +20,31 @@ const RECEIVE_CAPS = 'report-status side-band-64k delete-refs ofs-delta agent=fo
 
 function pkt(payload: string | Buffer): Buffer {
   return encodePktLine(payload);
+}
+
+/**
+ * Memoized git-protocol replies. An info/refs or upload-pack reply is a pure function of
+ * the repo's store, its refs and the request bytes; Repo.version bumps on every store or
+ * ref change, so (version, request) names a reply exactly and a hit is byte-identical to
+ * computing it again. The clone workload repeats one fetch fifty times concurrently; this
+ * turns forty-nine of them into a lookup. Bounded per repo; only 200s are kept.
+ */
+const gitReplyCache = new WeakMap<Repo, { version: number; replies: Map<string, GitReply> }>();
+
+function memoized(repo: Repo, key: string, make: () => GitReply): GitReply {
+  let slot = gitReplyCache.get(repo);
+  if (!slot || slot.version !== repo.version) {
+    slot = { version: repo.version, replies: new Map() };
+    gitReplyCache.set(repo, slot);
+  }
+  const hit = slot.replies.get(key);
+  if (hit) return hit;
+  const reply = make();
+  if (reply.status === 200) {
+    if (slot.replies.size >= 512) slot.replies.clear();
+    slot.replies.set(key, reply);
+  }
+  return reply;
 }
 
 function sortedRefs(repo: Repo): Array<[string, string]> {
@@ -54,6 +79,10 @@ export function infoRefs(forge: Forge, owner: string, name: string, service: str
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('unknown service\n') };
   }
+  return memoized(repo, `info|${service}|${protocolVersion ?? ''}`, () => infoRefsFresh(repo, service, protocolVersion));
+}
+
+function infoRefsFresh(repo: Repo, service: string, protocolVersion: string | null): GitReply {
   if (service === 'git-upload-pack' && protocolVersion === 'version=2') {
     const body = Buffer.concat([
       pkt('version 2\n'),
@@ -209,17 +238,19 @@ function fetchV0(repo: Repo, args: FetchArgs): Buffer {
 export function uploadPack(forge: Forge, owner: string, name: string, body: Buffer, protocolVersion: string | null): GitReply {
   const repo = owner === VIEWER.login ? forge.getRepo(owner, name) : undefined;
   if (!repo) return { status: 404, contentType: 'text/plain; charset=utf-8', body: Buffer.from('not found\n') };
-  try {
-    const packets = decodePktLines(body);
-    const firstData = packets.find((p) => p.kind === 'data');
-    const firstLine = firstData?.kind === 'data' ? firstData.payload.toString('utf8') : '';
-    if (protocolVersion === 'version=2' || firstLine.startsWith('command=')) {
-      return handleV2(repo, packets);
+  return memoized(repo, `up|${protocolVersion ?? ''}|${sha1Hex(body)}`, () => {
+    try {
+      const packets = decodePktLines(body);
+      const firstData = packets.find((p) => p.kind === 'data');
+      const firstLine = firstData?.kind === 'data' ? firstData.payload.toString('utf8') : '';
+      if (protocolVersion === 'version=2' || firstLine.startsWith('command=')) {
+        return handleV2(repo, packets);
+      }
+      return handleV0Fetch(repo, packets);
+    } catch {
+      return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('malformed request\n') };
     }
-    return handleV0Fetch(repo, packets);
-  } catch {
-    return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('malformed request\n') };
-  }
+  });
 }
 
 function handleV2(repo: Repo, packets: ReturnType<typeof decodePktLines>): GitReply {
@@ -370,14 +401,14 @@ function applyPushCommand(repo: Repo, command: PushCommand): string {
   if (newOid === ZERO_OID) {
     // Delete.
     if (!repo.refs.has(ref)) return `ng ${ref} reference does not exist\n`;
-    repo.refs.delete(ref);
+    repo.deleteRef(ref);
     return `ok ${ref}\n`;
   }
   const target = repo.store.get(newOid);
   if (!target) return `ng ${ref} unknown object\n`;
   if (oldOid === ZERO_OID) {
     if (repo.refs.has(ref)) return `ng ${ref} already exists\n`;
-    repo.refs.set(ref, newOid);
+    repo.setRef(ref, newOid);
     return `ok ${ref}\n`;
   }
   if (current !== oldOid) return `ng ${ref} stale info\n`;
@@ -385,6 +416,6 @@ function applyPushCommand(repo: Repo, command: PushCommand): string {
   if (target.type === 'commit' || target.type === 'tag') {
     if (!repo.store.isAncestor(oldOid, newOid)) return `ng ${ref} non-fast-forward\n`;
   }
-  repo.refs.set(ref, newOid);
+  repo.setRef(ref, newOid);
   return `ok ${ref}\n`;
 }

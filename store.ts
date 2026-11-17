@@ -96,6 +96,13 @@ export class Repo {
   readonly store = new ObjectStore();
   /** Full ref name (refs/heads/main) -> commit/tag object id. HEAD is refs/heads/<defaultBranch>. */
   readonly refs = new Map<string, string>();
+  /**
+   * Bumped on every store or ref change. A git-protocol reply depends only on the store,
+   * the refs and the request bytes, so (version, request) names a reply exactly; the HTTP
+   * layer memoizes on it. Objects arrive via put/putKnown (the store hook), refs via
+   * setRef/deleteRef.
+   */
+  version = 0;
   readonly issues = new Map<number, Issue>();
   readonly pulls = new Map<number, Pull>();
   readonly labels = new Map<string, Label>();
@@ -116,6 +123,20 @@ export class Repo {
     this.defaultBranch = defaultBranch;
     this.createdAt = clock.nowIso();
     this.updatedAt = this.createdAt;
+    this.store.onNewObject = () => {
+      this.version += 1;
+    };
+  }
+
+  setRef(ref: string, sha: string): void {
+    this.refs.set(ref, sha);
+    this.version += 1;
+  }
+
+  deleteRef(ref: string): boolean {
+    const removed = this.refs.delete(ref);
+    if (removed) this.version += 1;
+    return removed;
   }
 
   get fullName(): string {
@@ -213,7 +234,7 @@ export class Forge {
       message,
     });
     const sha = repo.store.put('commit', data);
-    repo.refs.set(ref, sha);
+    repo.setRef(ref, sha);
     repo.updatedAt = this.clock.nowIso();
     return sha;
   }

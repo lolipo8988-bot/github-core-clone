@@ -126,6 +126,25 @@ export function labelShape(ctx: HttpContext, repo: Repo, label: { id: number; na
   };
 }
 
+/**
+ * The serialized issue body for the two hottest REST paths (POST create, GET one). Every
+ * mutation route bumps the issue's updatedAt tick or its comment count (REST PATCH/comment,
+ * GraphQL closeIssue/addComment alike), so that pair plus the state and the request's base
+ * URL is a complete version stamp: a hit is byte-identical to a fresh issueShape stringify.
+ */
+const issueTextCache = new WeakMap<Issue, { stamp: string; text: string }>();
+
+export function issueReply(ctx: HttpContext, repo: Repo, issue: Issue, status: number): Reply {
+  const stamp = `${ctx.base}|${issue.updatedAt}|${issue.comments.length}|${issue.state}|${issue.title}|${issue.body ?? ''}|${issue.labels.join('')}`;
+  const hit = issueTextCache.get(issue);
+  if (hit && hit.stamp === stamp) {
+    return { status, rawBody: Buffer.from(hit.text, 'utf8'), contentType: 'application/json; charset=utf-8' };
+  }
+  const text = JSON.stringify(issueShape(ctx, repo, issue));
+  issueTextCache.set(issue, { stamp, text });
+  return { status, rawBody: Buffer.from(text, 'utf8'), contentType: 'application/json; charset=utf-8' };
+}
+
 export function issueShape(ctx: HttpContext, repo: Repo, issue: Issue) {
   const api = `${ctx.base}/api/v3/repos/${repo.fullName}`;
   return {
@@ -470,7 +489,7 @@ export function handleRest(ctx: HttpContext, req: RestRequest): Reply {
       const ref = typeof body.ref === 'string' ? body.ref : '';
       const sha = typeof body.sha === 'string' ? body.sha : '';
       if (!ref.startsWith('refs/') || !repo.store.get(sha)) return err(422, 'Validation Failed');
-      repo.refs.set(ref, sha);
+      repo.setRef(ref, sha);
       return json(201, gitRefShape(ctx, repo, ref, sha));
     }
     if (rest.length >= 3 && m === 'GET') {
@@ -481,7 +500,7 @@ export function handleRest(ctx: HttpContext, req: RestRequest): Reply {
     }
     if (rest.length >= 3 && m === 'DELETE') {
       const ref = `refs/${rest.slice(2).join('/')}`;
-      if (!repo.refs.delete(ref)) return notFound();
+      if (!repo.deleteRef(ref)) return notFound();
       return { status: 204 };
     }
     return notFound();
@@ -753,7 +772,7 @@ function handleIssues(ctx: HttpContext, repo: Repo, rest: string[], req: RestReq
       };
       repo.nextNumber += 1;
       repo.issues.set(issue.number, issue);
-      return json(201, issueShape(ctx, repo, issue));
+      return issueReply(ctx, repo, issue, 201);
     }
     if (m === 'GET') {
       const state = req.query.get('state') ?? 'open';
@@ -773,7 +792,7 @@ function handleIssues(ctx: HttpContext, repo: Repo, rest: string[], req: RestReq
 
   if (rest.length === 1) {
     if (!issue) return notFound();
-    if (m === 'GET') return json(200, issueShape(ctx, repo, issue));
+    if (m === 'GET') return issueReply(ctx, repo, issue, 200);
     if (m === 'PATCH') {
       if (req.bodyError) return err(400, 'Problems parsing JSON');
       const body = (req.body ?? {}) as Record<string, unknown>;

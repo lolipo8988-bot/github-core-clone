@@ -170,6 +170,8 @@ export function buildCommit(fields: {
 
 export class ObjectStore {
   readonly objects = new Map<string, GitObject>();
+  /** Called whenever an object the store did not hold is added (the Repo's cache version). */
+  onNewObject: (() => void) | null = null;
 
   has(sha: string): boolean {
     return this.objects.has(sha);
@@ -182,12 +184,18 @@ export class ObjectStore {
   /** Store an object's payload; returns its id. Idempotent. */
   put(type: GitObjectType, data: Buffer): string {
     const sha = hashObject(type, data);
-    if (!this.objects.has(sha)) this.objects.set(sha, { type, data });
+    if (!this.objects.has(sha)) {
+      this.objects.set(sha, { type, data });
+      this.onNewObject?.();
+    }
     return sha;
   }
 
   putKnown(sha: string, type: GitObjectType, data: Buffer): void {
-    if (!this.objects.has(sha)) this.objects.set(sha, { type, data });
+    if (!this.objects.has(sha)) {
+      this.objects.set(sha, { type, data });
+      this.onNewObject?.();
+    }
   }
 
   /** The depth-limited closure of `tips`: commits within `depth` generations of a tip (tip = 1;
@@ -409,8 +417,32 @@ export class ObjectStore {
 // packfiles
 // ---------------------------------------------------------------------------
 
+interface InflateInfoResult {
+  buffer: Buffer;
+  engine: { bytesWritten: number };
+}
+
 /** Inflate the deflate stream starting at `offset`; returns the data and the offset just past it. */
 export function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
+  // One inflate of the remaining bytes: zlib stops at the stream's end and ignores the rest,
+  // and the engine's bytesWritten is exactly the compressed length it consumed. This replaces
+  // a binary search that re-inflated the same object a dozen times per pack object.
+  const rest = buffer.subarray(offset);
+  try {
+    const result = (inflateSync as unknown as (data: Buffer, options: { info: true }) => InflateInfoResult)(rest, { info: true });
+    const consumed = result.engine.bytesWritten;
+    if (Number.isSafeInteger(consumed) && consumed > 0 && consumed <= rest.length) {
+      return { data: result.buffer, next: offset + consumed };
+    }
+  } catch {
+    // A truncated or corrupt stream throws here as it did before; the search below re-finds
+    // the failure on its own terms (and throws the same way) for any input this path rejects.
+  }
+  return inflateAtBySearch(buffer, offset);
+}
+
+/** The original search-based inflate: the shortest prefix of the stream that inflates fully. */
+function inflateAtBySearch(buffer: Buffer, offset: number): { data: Buffer; next: number } {
   // zlib streams are self-terminating and no proper prefix of one inflates, so binary-search the
   // shortest slice that inflates to the full output.
   const rest = buffer.subarray(offset);
